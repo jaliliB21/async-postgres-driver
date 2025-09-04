@@ -123,6 +123,69 @@ class Driver:
             await self.close()
             return
 
+    async def execute(self, query_string):
+        """
+        Sends a query to the server and parses the response.
+        """
+        # 1. Build the Query message
+        query_bytes = query_string.encode('utf-8') + b'\x00'
+        # Message format: 'Q' + MessageLength + QueryString
+        msg = b'Q' + struct.pack('!I', 4 + len(query_bytes)) + query_bytes
+        
+        # 2. Send the message
+        self.writer.write(msg)
+        await self.writer.drain()
+        print(f"\n🚀 Sent query: {query_string}")
+
+        # 3. Process the response
+        results = []
+        columns = []
+        try:
+            while True:
+                header = await self.reader.readexactly(5)
+                msg_type, msg_len = struct.unpack('!cI', header)
+                msg_type = msg_type.decode('ascii')
+                
+                msg_content_len = msg_len - 4
+                msg_content = b''
+                if msg_content_len > 0:
+                    msg_content = await self.reader.readexactly(msg_content_len)
+
+                if msg_type == 'T': # RowDescription
+                    # This message describes the columns of the result set
+                    num_fields = struct.unpack('!H', msg_content[:2])[0]
+                    # We can parse more details later, for now just a placeholder
+                    print(f"🔍 Query will return {num_fields} columns.")
+                    # For now we will manually name them for our test query
+                    columns = ['number', 'text']
+                
+                elif msg_type == 'D': # DataRow
+                    # This message contains the actual data for one row
+                    num_cols = struct.unpack('!H', msg_content[:2])[0]
+                    col_offset = 2
+                    row = {}
+                    for i in range(num_cols):
+                        # Read the length of the column data
+                        col_len = struct.unpack('!I', msg_content[col_offset:col_offset+4])[0]
+                        col_offset += 4
+                        # Read the column data and decode it
+                        col_data = msg_content[col_offset:col_offset+col_len].decode('utf-8')
+                        col_offset += col_len
+                        row[columns[i]] = col_data
+                    results.append(row)
+
+                elif msg_type == 'C': # CommandComplete
+                    print("Query executed successfully.")
+                    # We can parse the command tag here later (e.g., "SELECT 1")
+                
+                elif msg_type == 'Z': # ReadyForQuery
+                    # The server is ready for the next command, so we are done
+                    return results
+
+        except Exception as e:
+            print(f"Error during query execution: {e}")
+            return None
+
     async def close(self):
         if self.writer:
             self.writer.close()
@@ -140,8 +203,16 @@ async def main():
     }
     driver = Driver(db_config)
     await driver.connect()
+    
     if driver.writer:
+        # If connection was successful, execute a query
+        rows = await driver.execute("SELECT 1 AS number, 'hello world' AS text;")
+        if rows:
+            print("\n📊 Query Results:")
+            print(rows)
+        
         await driver.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
