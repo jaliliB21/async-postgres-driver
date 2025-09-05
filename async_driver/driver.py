@@ -5,25 +5,30 @@ import hmac
 import base64
 import os
 
-# Import our new custom modules
+# Import our custom modules
 from . import protocol
 from . import exceptions
-
+from . import types
 
 class Driver:
     def __init__(self, db_config):
+        """
+        Initializes the driver with database configuration.
+        """
         self.db_config = db_config
         self.reader = None
         self.writer = None
 
     async def connect(self):
+        """
+        Establishes a connection and handles the server handshake and authentication process.
+        """
         host = self.db_config.get("host", "localhost")
         port = self.db_config.get("port", 5432)
 
         try:
             self.reader, self.writer = await asyncio.open_connection(host, port)
         except OSError as e:
-            # Raise our custom, more specific exception
             raise exceptions.ConnectionError(f"TCP connection failed: {e}")
 
         # Use the helper function from protocol.py to build the message
@@ -61,7 +66,6 @@ class Driver:
                         self.writer.write(msg)
                         await self.writer.drain()
                         
-                    # ----------------- START OF COMMENTED SECTION -----------------
                     elif auth_status_code == 11: # SCRAM-SHA-256 Continue
                         # This block is executed after the server sends its challenge.
                         # We must now compute the client proof and send it back.
@@ -102,7 +106,6 @@ class Driver:
                         
                     elif auth_status_code == 12: # SCRAM-SHA-256 Final
                         pass
-                    # ------------------ END OF COMMENTED SECTION ------------------
                     
                     else:
                         raise exceptions.AuthenticationError(f"Unsupported auth method (code: {auth_status_code}).")
@@ -121,18 +124,19 @@ class Driver:
         except exceptions.DriverError:
              raise
         except Exception as e:
-            # Wrap unexpected errors in our custom exception
             raise exceptions.ConnectionError(f"Connection lost during handshake: {e}")
-            
+
     async def execute(self, query_string):
-        # Use the helper function from protocol.py to build the message
+        """
+        Sends a query to the server and parses the response with correct data types.
+        """
         msg = protocol.create_query_message(query_string)
         
         self.writer.write(msg)
         await self.writer.drain()
 
         results = []
-        columns = []
+        column_info = []  # Will now store {'name': str, 'type_oid': int}
         try:
             while True:
                 header = await self.reader.readexactly(5)
@@ -144,30 +148,56 @@ class Driver:
                 if msg_content_len > 0:
                     msg_content = await self.reader.readexactly(msg_content_len)
 
-                if msg_type == 'T': # RowDescription
-                    columns = ['number', 'text']
-                elif msg_type == 'D': # DataRow
+                if msg_type == 'T':  # RowDescription
+                    # This message describes the columns of the result set.
+                    # We parse it to get column names and their Type OIDs.
+                    column_info.clear()  # Ensure it's empty for the new query
+                    num_fields = struct.unpack('!H', msg_content[:2])[0]
+                    
+                    offset = 2
+                    for _ in range(num_fields):
+                        null_idx = msg_content.find(b'\x00', offset)
+                        col_name = msg_content[offset:null_idx].decode('utf-8')
+                        offset = null_idx + 1
+                        
+                        _table_oid, _col_attr_num, type_oid, _type_size, _type_mod, _format_code = struct.unpack('!IHihih', msg_content[offset:offset+18])
+                        offset += 18
+                        
+                        column_info.append({'name': col_name, 'type_oid': type_oid})
+
+                elif msg_type == 'D':  # DataRow
+                    # This message contains the actual data for one row.
                     num_cols = struct.unpack('!H', msg_content[:2])[0]
-                    col_offset = 2
+                    offset = 2
                     row = {}
                     for i in range(num_cols):
-                        col_len = struct.unpack('!I', msg_content[col_offset:col_offset+4])[0]
-                        col_offset += 4
-                        col_data = msg_content[col_offset:col_offset+col_len].decode('utf-8')
-                        col_offset += col_len
-                        row[columns[i]] = col_data
+                        col_len = struct.unpack('!I', msg_content[offset:offset+4])[0]
+                        offset += 4
+                        
+                        col_data_bytes = msg_content[offset:offset+col_len]
+                        
+                        # Get the metadata for the current column
+                        col_meta = column_info[i]
+                        # Find the correct parser using our types.py map
+                        parser = types.get_parser(col_meta['type_oid'])
+                        # Use the parser to convert bytes to the correct Python type
+                        parsed_value = parser(col_data_bytes)
+                        
+                        row[col_meta['name']] = parsed_value
+                        offset += col_len
+                        
                     results.append(row)
-                elif msg_type == 'C': # CommandComplete
+
+                elif msg_type == 'C':  # CommandComplete
                     pass
-                elif msg_type == 'Z': # ReadyForQuery
+                elif msg_type == 'Z':  # ReadyForQuery
                     return results
-                elif msg_type == 'E': # ErrorResponse
+                elif msg_type == 'E':  # ErrorResponse
                     error_fields = {k.decode('utf-8'): v.decode('utf-8') for k, v in (field.split(b'\x00', 1) for field in msg_content.split(b'\x00') if field)}
                     message = error_fields.get('M', 'Unknown error')
                     raise exceptions.QueryError(f"Server error during query: {message}")
 
         except Exception as e:
-            # Wrap unexpected errors in our custom exception
             raise exceptions.QueryError(f"Failed during query execution: {e}")
 
     async def close(self):
@@ -187,14 +217,24 @@ async def main():
     driver = Driver(db_config)
     try:
         await driver.connect()
-        rows = await driver.execute("SELECT 1 AS number, 'hello world' AS text;")
+
+        query = "SELECT 123 AS an_integer, 'hello from pg' AS a_text, TRUE AS a_boolean;"
+        rows = await driver.execute(query)
+        
         if rows:
+            print("\nQuery Results:")
             print(rows)
+            first_row = rows[0]
+            print("\nData Types:")
+            for col, val in first_row.items():
+                print(f"  - Column '{col}' has value '{val}' of type: {type(val)}")
+
     except exceptions.DriverError as e:
         print(f"\nA driver-specific error occurred: {e}")
     finally:
         if driver.writer and not driver.writer.is_closing():
             await driver.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
