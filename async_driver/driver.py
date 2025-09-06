@@ -244,30 +244,3 @@ class Driver:
         if self.writer:
             self.writer.close()
             await self.writer.wait_closed()
-
-
-async def main():
-    db_config = {
-        "user": "myuser",
-        "password": "mypassword",
-        "database": "mydb",
-        "host": "localhost",
-        "port": 5432
-    }
-    driver = Driver(db_config)
-    try:
-        await driver.connect()
-        
-        print("\n--- Testing Query without Parameters ---")
-        rows_no_params = await driver.execute("SELECT 1 AS number, 'test' AS text;", [])
-        print("Query Result:", rows_no_params)
-
-    except exceptions.DriverError as e:
-        print(f"\nAn error occurred: {e}")
-    finally:
-        if driver.writer and not driver.writer.is_closing():
-            await driver.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
