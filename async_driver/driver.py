@@ -10,6 +10,7 @@ from . import protocol
 from . import exceptions
 from . import types
 
+
 class Driver:
     def __init__(self, db_config):
         """
@@ -111,8 +112,17 @@ class Driver:
                         raise exceptions.AuthenticationError(f"Unsupported auth method (code: {auth_status_code}).")
 
                 elif msg_type == 'E': # ErrorResponse
-                    error_fields = {k.decode('utf-8'): v.decode('utf-8') for k, v in (field.split(b'\x00', 1) for field in msg_content.split(b'\x00') if field)}
-                    message = error_fields.get('M', 'Unknown error')
+                    # The corrected, safe way to parse error messages.
+                    fields = {}
+                    offset = 0
+                    while offset < len(msg_content) and msg_content[offset] != 0:
+                        field_type = chr(msg_content[offset])
+                        offset += 1
+                        null_idx = msg_content.find(b'\x00', offset)
+                        field_value = msg_content[offset:null_idx].decode('utf-8')
+                        offset = null_idx + 1
+                        fields[field_type] = field_value
+                    message = fields.get('M', 'Unknown server error')
                     raise exceptions.DriverError(f"Server error: {message}")
 
                 elif msg_type == 'K' or msg_type == 'S': # BackendKeyData or ParameterStatus
@@ -126,79 +136,109 @@ class Driver:
         except Exception as e:
             raise exceptions.ConnectionError(f"Connection lost during handshake: {e}")
 
-    async def execute(self, query_string):
+    async def execute(self, query_string: str, params: list = []):
         """
-        Sends a query to the server and parses the response with correct data types.
+        Executes a parameterized query using the Extended Query Protocol.
+        This is the single, secure way to run all queries.
+        For queries without parameters, pass an empty list for params.
         """
-        msg = protocol.create_query_message(query_string)
+        # --- Extended Query Protocol Steps ---
         
-        self.writer.write(msg)
+        # 1. PARSE: Send the query template to the server for validation.
+        query_bytes = query_string.encode('utf-8') + b'\x00'
+        parse_msg = b'P' + struct.pack('!I', 4 + 1 + len(query_bytes) + 2) + b'\x00' + query_bytes + struct.pack('!H', 0)
+        
+        # 2. BIND: Send the actual parameters to bind to the parsed statement.
+        param_bytes = b''
+        for p in params:
+            p_bytes = str(p).encode('utf-8')
+            param_bytes += struct.pack('!I', len(p_bytes)) + p_bytes
+        
+        bind_msg = b'B' + struct.pack('!I', 4 + 1 + 1 + 2 + 2 + len(param_bytes) + 2) + \
+           b'\x00\x00' + \
+           struct.pack('!H', 0) + \
+           struct.pack('!H', len(params)) + param_bytes + \
+           struct.pack('!H', 0)
+                   
+        # 3. DESCRIBE: Ask the server to describe the results of the query.
+        describe_msg = b'D' + struct.pack('!I', 4 + 1 + 1) + b'P\x00'
+
+        # 4. EXECUTE: Tell the server to run the bound statement.
+        execute_msg = b'E' + struct.pack('!I', 4 + 1 + 4) + b'\x00' + struct.pack('!I', 0)
+        
+        # 5. SYNC: Tell the server we are done and expect it to finish and respond.
+        sync_msg = b'S' + struct.pack('!I', 4)
+
+        # --- Send all messages in a single batch for efficiency ---
+        self.writer.write(parse_msg + bind_msg + describe_msg + execute_msg + sync_msg)
         await self.writer.drain()
-
+        
+        # --- Response Handling Loop ---
         results = []
-        column_info = []  # Will now store {'name': str, 'type_oid': int}
-        try:
-            while True:
-                header = await self.reader.readexactly(5)
-                msg_type, msg_len = struct.unpack('!cI', header)
-                msg_type = msg_type.decode('ascii')
-                
-                msg_content_len = msg_len - 4
-                msg_content = b''
-                if msg_content_len > 0:
-                    msg_content = await self.reader.readexactly(msg_content_len)
+        column_info = []
+        done = False
+        while not done:
+            header = await self.reader.readexactly(5)
+            msg_type, msg_len = struct.unpack('!cI', header)
+            msg_type = msg_type.decode('ascii')
+            
+            msg_content_len = msg_len - 4
+            msg_content = b''
+            if msg_content_len > 0:
+                msg_content = await self.reader.readexactly(msg_content_len)
 
-                if msg_type == 'T':  # RowDescription
-                    # This message describes the columns of the result set.
-                    # We parse it to get column names and their Type OIDs.
-                    column_info.clear()  # Ensure it's empty for the new query
-                    num_fields = struct.unpack('!H', msg_content[:2])[0]
-                    
-                    offset = 2
-                    for _ in range(num_fields):
-                        null_idx = msg_content.find(b'\x00', offset)
-                        col_name = msg_content[offset:null_idx].decode('utf-8')
-                        offset = null_idx + 1
-                        
-                        _table_oid, _col_attr_num, type_oid, _type_size, _type_mod, _format_code = struct.unpack('!IHihih', msg_content[offset:offset+18])
-                        offset += 18
-                        
-                        column_info.append({'name': col_name, 'type_oid': type_oid})
-
-                elif msg_type == 'D':  # DataRow
-                    # This message contains the actual data for one row.
-                    num_cols = struct.unpack('!H', msg_content[:2])[0]
-                    offset = 2
-                    row = {}
-                    for i in range(num_cols):
-                        col_len = struct.unpack('!I', msg_content[offset:offset+4])[0]
-                        offset += 4
-                        
+            if msg_type == '1' or msg_type == '2': # ParseComplete or BindComplete
+                pass
+            elif msg_type == 't': # ParameterDescription
+                pass
+            elif msg_type == 'n': # NoData
+                 pass
+            elif msg_type == 'T': # RowDescription
+                column_info.clear()
+                num_fields = struct.unpack('!H', msg_content[:2])[0]
+                offset = 2
+                for _ in range(num_fields):
+                    null_idx = msg_content.find(b'\x00', offset)
+                    col_name = msg_content[offset:null_idx].decode('utf-8')
+                    offset = null_idx + 1
+                    _table_oid, _col_attr_num, type_oid, _type_size, _type_mod, _format_code = struct.unpack('!IHihih', msg_content[offset:offset+18])
+                    offset += 18
+                    column_info.append({'name': col_name, 'type_oid': type_oid})
+            elif msg_type == 'D': # DataRow
+                num_cols = struct.unpack('!H', msg_content[:2])[0]
+                offset = 2
+                row = {}
+                for i in range(num_cols):
+                    col_len, = struct.unpack('!i', msg_content[offset:offset+4])
+                    offset += 4
+                    if col_len == -1: # Handle NULL values
+                        parsed_value = None
+                    else:
                         col_data_bytes = msg_content[offset:offset+col_len]
-                        
-                        # Get the metadata for the current column
                         col_meta = column_info[i]
-                        # Find the correct parser using our types.py map
                         parser = types.get_parser(col_meta['type_oid'])
-                        # Use the parser to convert bytes to the correct Python type
                         parsed_value = parser(col_data_bytes)
-                        
-                        row[col_meta['name']] = parsed_value
                         offset += col_len
-                        
-                    results.append(row)
-
-                elif msg_type == 'C':  # CommandComplete
-                    pass
-                elif msg_type == 'Z':  # ReadyForQuery
-                    return results
-                elif msg_type == 'E':  # ErrorResponse
-                    error_fields = {k.decode('utf-8'): v.decode('utf-8') for k, v in (field.split(b'\x00', 1) for field in msg_content.split(b'\x00') if field)}
-                    message = error_fields.get('M', 'Unknown error')
-                    raise exceptions.QueryError(f"Server error during query: {message}")
-
-        except Exception as e:
-            raise exceptions.QueryError(f"Failed during query execution: {e}")
+                    row[column_info[i]['name']] = parsed_value
+                results.append(row)
+            elif msg_type == 'C': # CommandComplete
+                pass
+            elif msg_type == 'Z': # ReadyForQuery
+                done = True
+            elif msg_type == 'E': # ErrorResponse
+                fields = {}
+                offset = 0
+                while offset < len(msg_content) and msg_content[offset] != 0:
+                    field_type = chr(msg_content[offset])
+                    offset += 1
+                    null_idx = msg_content.find(b'\x00', offset)
+                    field_value = msg_content[offset:null_idx].decode('utf-8')
+                    offset = null_idx + 1
+                    fields[field_type] = field_value
+                message = fields.get('M', 'Unknown server error')
+                raise exceptions.QueryError(f"Server error: {message}")
+        
+        return results
 
     async def close(self):
         if self.writer:
@@ -217,20 +257,13 @@ async def main():
     driver = Driver(db_config)
     try:
         await driver.connect()
-
-        query = "SELECT 123 AS an_integer, 'hello from pg' AS a_text, TRUE AS a_boolean;"
-        rows = await driver.execute(query)
         
-        if rows:
-            print("\nQuery Results:")
-            print(rows)
-            first_row = rows[0]
-            print("\nData Types:")
-            for col, val in first_row.items():
-                print(f"  - Column '{col}' has value '{val}' of type: {type(val)}")
+        print("\n--- Testing Query without Parameters ---")
+        rows_no_params = await driver.execute("SELECT 1 AS number, 'test' AS text;", [])
+        print("Query Result:", rows_no_params)
 
     except exceptions.DriverError as e:
-        print(f"\nA driver-specific error occurred: {e}")
+        print(f"\nAn error occurred: {e}")
     finally:
         if driver.writer and not driver.writer.is_closing():
             await driver.close()
